@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>CSV Viewer</title>
+  <link rel="stylesheet" href="https://cdn.datatables.net/2.0.8/css/dataTables.dataTables.min.css">
+  <link href="https://cdn.tailwindcss.com" rel="stylesheet">
+</head>
+<body class="p-6 bg-white">
+  <h2 class="text-2xl font-semibold mb-4">検出ログ</h2>
+  <table id="csvTable" class="display w-full"></table>
+  <a href="/" class="mt-6 text-sky-600 underline block">← 戻る</a>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+  <script src="https://cdn.datatables.net/2.0.8/js/dataTables.min.js"></script>
+  <script src="{{ url_for('static', filename='js/csv.js') }}"></script>
+</body>
+</html>
