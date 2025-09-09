@@ -5,3 +5,4 @@ venv/
 *.pt
 logs/
 *.csv
+models/best.pt
