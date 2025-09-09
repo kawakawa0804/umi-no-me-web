@@ -6,3 +6,9 @@ venv/
 logs/
 *.csv
 models/best.pt
+venv/
+models/best.pt
+__pycache__/
+*.pyc
+logs/
+.DS_Store
