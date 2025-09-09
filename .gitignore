@@ -12,3 +12,10 @@ __pycache__/
 *.pyc
 logs/
 .DS_Store
+venv/
+.venv/
+models/best.pt
+logs/
+__pycache__/
+*.pyc
+.DS_Store
