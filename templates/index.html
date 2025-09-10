@@ -1,15 +1,131 @@
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Umi no Me</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    #video { width: 100%; max-width: 640px; background:#000; border-radius: 12px; }
+    #controls { margin: 12px 0; display:flex; gap:8px; flex-wrap:wrap; }
+    #status { white-space: pre-wrap; color:#444; }
+    select,button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; }
+    button.primary { background:#1f7ae0; color:#fff; border:none; }
+    a.button { text-decoration:none; padding:8px 12px; border-radius:10px; border:1px solid #ccc; }
+  </style>
 </head>
-<body class="bg-sky-100 flex flex-col items-center justify-center min-h-screen gap-8">
-  <h1 class="text-4xl font-bold">Umi no Me</h1>
-  <div class="flex gap-4">
-    <a href="/camera" class="px-6 py-3 rounded-xl bg-emerald-600 text-white shadow-lg">カメラを起動</a>
-    <a href="/csv"    class="px-6 py-3 rounded-xl bg-indigo-600 text-white shadow-lg">CSV を閲覧</a>
+<body>
+  <h1>Umi no Me</h1>
+
+  <div id="controls">
+    <button id="startBtn" class="primary">カメラ開始</button>
+    <button id="snapBtn">1枚撮って検出</button>
+    <button id="stopBtn">停止</button>
+    <a class="button" href="/csv" target="_blank">CSVを見る</a>
+    <select id="cameraSelect" title="カメラを選択"></select>
+    <span id="httpsWarn" style="display:none;color:#c00;font-weight:bold;">
+      このページは HTTPS ではありません。HTTPS で開いてください。
+    </span>
   </div>
+
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas" width="640" height="480" style="display:none"></canvas>
+  <div id="status"></div>
+  <pre id="result" style="white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:8px"></pre>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const startBtn = document.getElementById('startBtn');
+    const snapBtn = document.getElementById('snapBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const cameraSelect = document.getElementById('cameraSelect');
+    const statusEl = document.getElementById('status');
+    const resultEl = document.getElementById('result');
+    const httpsWarn = document.getElementById('httpsWarn');
+
+    const isSecure = location.protocol === 'https:' || location.hostname === 'localhost';
+    if (!isSecure) httpsWarn.style.display = 'inline';
+
+    function log(msg) { statusEl.textContent = msg; console.log(msg); }
+
+    async function listCameras() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videos = devices.filter(d => d.kind === 'videoinput');
+      cameraSelect.innerHTML = '';
+      videos.forEach((d, i) => {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `カメラ ${i + 1}`;
+        cameraSelect.appendChild(opt);
+      });
+    }
+
+    let currentStream = null;
+
+    async function startCamera(deviceId) {
+      if (!isSecure) { log('HTTPSで開いてください'); return; }
+      try {
+        if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+        const constraints = {
+          audio: false,
+          video: deviceId ? { deviceId: { exact: deviceId } } :
+                            { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }
+        };
+        log('カメラ起動中…（権限を許可）');
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = currentStream;
+        await video.play();
+        await listCameras(); // 許可後にラベルが出る
+        log('カメラ起動OK。必要なときだけ「1枚撮って検出」を押してください。');
+      } catch (e) {
+        log('カメラ起動失敗: ' + e.message);
+      }
+    }
+
+    function stopCamera() {
+      if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+      currentStream = null;
+      log('カメラ停止');
+    }
+
+    function grabFrameBlob(quality = 0.6) {
+      const w = Math.min(640, video.videoWidth || 640);
+      const h = Math.round((video.videoHeight || 480) * (w / (video.videoWidth || 640)));
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, w, h);
+      return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+    }
+
+    async function detectOnce() {
+      try {
+        log('1枚キャプチャ → 送信中...');
+        const blob = await grabFrameBlob(0.6);
+        const fd = new FormData();
+        fd.append('image', blob, 'frame.jpg');
+        const res = await fetch('/detect', { method: 'POST', body: fd });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`HTTP ${res.status} ${text}`);
+        }
+        const data = await res.json();
+        resultEl.textContent = JSON.stringify(data, null, 2);
+        log('検出完了');
+      } catch (e) {
+        resultEl.textContent = '';
+        log('検出エラー: ' + e.message);
+      }
+    }
+
+    startBtn.addEventListener('click', () => startCamera(cameraSelect.value || null));
+    snapBtn.addEventListener('click', () => detectOnce());
+    stopBtn.addEventListener('click', () => stopCamera());
+    cameraSelect.addEventListener('change', () => startCamera(cameraSelect.value));
+
+    // 初期
+    if (navigator.mediaDevices?.enumerateDevices) listCameras();
+    log('まず「カメラ開始」を押してください。');
+  </script>
 </body>
 </html>
