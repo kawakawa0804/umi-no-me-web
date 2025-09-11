@@ -3,55 +3,63 @@ import io
 import csv
 import base64
 import datetime
-from collections import deque
+import threading
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
 
-# ===== Flask =====
+# ================== Flask ==================
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MBまで
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2MBまでに抑える（負荷軽減）
 
-# ===== Paths & Env =====
+# ================== Paths & Env ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(BASE_DIR, "models", "best.pt"))
 
-# Ultralyticsが書込不可で落ちないように
+# Ultralytics/BLASのスレッドを抑制（CPU負荷・メモリ圧縮）
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# ===== Lazy model holder =====
+# ================== Model (lazy) ==================
 model = None
+_model_lock = threading.Lock()     # モデル読み込みの排他
+_infer_lock = threading.Lock()     # 推論を同時に1つに制限（Free環境での安定化）
 
-def ensure_model_loaded():
-    """必要時のみモデルを読み込む（起動を軽く）"""
+def _ensure_model_loaded() -> bool:
+    """必要時にのみモデルを読み込む（起動を軽く）"""
     global model
     if model is not None:
         return True
     if not os.path.exists(MODEL_PATH):
         print(f"[WARN] Model not found at {MODEL_PATH}")
         return False
-    try:
-        from ultralytics import YOLO
+    with _model_lock:
+        if model is not None:
+            return True
         try:
-            import torch
-            torch.set_num_threads(1)
-        except Exception:
-            pass
-        model = YOLO(MODEL_PATH)
-        print(f"[INFO] Model loaded: {MODEL_PATH}")
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to load model: {e}")
-        model = None
-        return False
+            from ultralytics import YOLO
+            try:
+                import torch
+                torch.set_num_threads(1)  # CPUスレッドさらに絞る
+            except Exception:
+                pass
+            m = YOLO(MODEL_PATH)
+            model = m
+            print(f"[INFO] Model loaded: {MODEL_PATH}")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to load model: {e}")
+            model = None
+            return False
 
-# ===== Logs =====
+# ================== Logs ==================
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 CSV_PATH = os.path.join(LOG_DIR, "detections.csv")
 
-def append_detections(rows):
+def _append_rows(rows):
     # rows: list[dict]
     with open(CSV_PATH, mode="a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -61,7 +69,7 @@ def append_detections(rows):
                 d["class_id"], d["confidence"], *d["bbox"]
             ])
 
-# ===== Utils =====
+# ================== Utils ==================
 def _read_image_bytes():
     """
     - multipart/form-data: file フィールド 'image' または 'file'
@@ -77,16 +85,14 @@ def _read_image_bytes():
         if isinstance(data_url, str) and "base64," in data_url:
             b64 = data_url.split("base64,", 1)[1]
             return base64.b64decode(b64)
-
     return None
 
-# ===== Routes =====
+# ================== Routes ==================
 @app.route("/")
 def index():
     try:
         return render_template("index.html")
     except Exception:
-        # テンプレが無くても起動確認できるように
         return "<h1>Umi no Me</h1><p>Server is running.</p>", 200
 
 @app.route("/health")
@@ -95,63 +101,73 @@ def health():
 
 @app.route("/detect", methods=["POST"])
 def detect():
-    # モデル未配置なら落とさず通知
-    if not ensure_model_loaded():
-        return jsonify({"error": "Model not available"}), 503
-
-    img_bytes = _read_image_bytes()
-    if not img_bytes:
-        return jsonify({"error": "No image provided"}), 400
-
-    # 画像をnumpyにデコード（OpenCV）
-    import numpy as np
-    import cv2
-
-    arr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
-
-    # 軽量化（解像度を抑える）
-    target_w = 640
-    if img is None:
-        return jsonify({"error": "Failed to decode image"}), 400
-    h, w = img.shape[:2]
-    if w > target_w:
-        scale = target_w / float(w)
-        img = cv2.resize(img, (target_w, int(h * scale)), interpolation=cv2.INTER_AREA)
-
-    # 推論（CPU・低負荷設定）
+    # 同時推論は1件に制限（重複は弾く）
+    if not _infer_lock.acquire(blocking=False):
+        return jsonify({"error": "busy"}), 429
     try:
-        results = model.predict(
-            source=img,
-            imgsz=416,        # 小さめ
-            conf=0.35,        # 信頼度しきい値
-            iou=0.5,
-            device="cpu",
-            verbose=False,
-            stream=False
-        )
-    except Exception as e:
-        return jsonify({"error": f"inference failed: {e}"}), 500
+        if not _ensure_model_loaded():
+            return jsonify({"error": "Model not available"}), 503
 
-    detections = []
-    try:
-        for r in results:
-            for box in r.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                xyxy = [float(x) for x in box.xyxy[0].tolist()]
-                detections.append({"class_id": cls_id, "confidence": conf, "bbox": xyxy})
-    except Exception as e:
-        return jsonify({"error": f"parse failed: {e}"}), 500
+        img_bytes = _read_image_bytes()
+        if not img_bytes:
+            return jsonify({"error": "No image provided"}), 400
 
-    if detections:
-        append_detections(detections)
+        import numpy as np
+        import cv2
 
-    return jsonify(detections)
+        arr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
+        if img is None:
+            return jsonify({"error": "Failed to decode image"}), 400
+
+        # さらに縮小（幅480px目安）
+        target_w = 480
+        h, w = img.shape[:2]
+        if w > target_w:
+            scale = target_w / float(w)
+            img = cv2.resize(img, (target_w, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        # 軽量推論設定（CPU）
+        try:
+            results = model.predict(
+                source=img,
+                imgsz=320,         # さらに小さく
+                conf=0.45,         # しきい値上げで後段を軽く
+                iou=0.5,
+                max_det=3,         # 出力を絞る
+                agnostic_nms=True, # NMSを単純化
+                device="cpu",
+                half=False,
+                retina_masks=False,
+                classes=None,      # 特定クラスだけに絞るなら [0,1,...] を指定
+                verbose=False,
+                stream=False
+            )
+        except Exception as e:
+            return jsonify({"error": f"inference failed: {e}"}), 500
+
+        detections = []
+        try:
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    xyxy = [float(x) for x in box.xyxy[0].tolist()]
+                    detections.append({"class_id": cls_id, "confidence": conf, "bbox": xyxy})
+        except Exception as e:
+            return jsonify({"error": f"parse failed: {e}"}), 500
+
+        if detections:
+            _append_rows(detections)
+
+        return jsonify(detections)
+    finally:
+        _infer_lock.release()
 
 @app.route("/csv")
 def csv_view():
-    """detections.csv の最後の200行だけをHTMLで表示（重くならないように）"""
+    """detections.csv の最後の200行だけHTML表示（軽量）"""
+    from collections import deque
     rows = deque(maxlen=200)
     if os.path.exists(CSV_PATH):
         with open(CSV_PATH, newline="", encoding="utf-8") as f:
@@ -159,7 +175,6 @@ def csv_view():
             for row in reader:
                 rows.append(row)
 
-    # 簡単なHTML
     html = [
         "<html><head><meta charset='utf-8'><title>detections.csv (tail 200)</title>",
         "<style>table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px}</style>",
@@ -177,7 +192,6 @@ def csv_view():
 @app.route("/logs/detections.csv")
 def csv_download():
     if not os.path.exists(CSV_PATH):
-        # 空のCSVを返す
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["time", "class_id", "confidence", "x1", "y1", "x2", "y2"])

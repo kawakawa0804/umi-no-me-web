@@ -6,7 +6,7 @@
   <title>Umi no Me</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 16px; }
-    #video { width: 100%; max-width: 640px; background:#000; border-radius: 12px; }
+    #video { width: 100%; max-width: 480px; background:#000; border-radius: 12px; }
     #controls { margin: 12px 0; display:flex; gap:8px; flex-wrap:wrap; }
     #status { white-space: pre-wrap; color:#444; }
     select,button { padding:8px 12px; border-radius:10px; border:1px solid #ccc; }
@@ -29,7 +29,7 @@
   </div>
 
   <video id="video" autoplay playsinline muted></video>
-  <canvas id="canvas" width="640" height="480" style="display:none"></canvas>
+  <canvas id="canvas" width="480" height="360" style="display:none"></canvas>
   <div id="status"></div>
   <pre id="result" style="white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:8px"></pre>
 
@@ -50,18 +50,21 @@
     function log(msg) { statusEl.textContent = msg; console.log(msg); }
 
     async function listCameras() {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const videos = devices.filter(d => d.kind === 'videoinput');
-      cameraSelect.innerHTML = '';
-      videos.forEach((d, i) => {
-        const opt = document.createElement('option');
-        opt.value = d.deviceId;
-        opt.textContent = d.label || `カメラ ${i + 1}`;
-        cameraSelect.appendChild(opt);
-      });
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videos = devices.filter(d => d.kind === 'videoinput');
+        cameraSelect.innerHTML = '';
+        videos.forEach((d, i) => {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `カメラ ${i + 1}`;
+          cameraSelect.appendChild(opt);
+        });
+      } catch (e) { console.warn(e); }
     }
 
     let currentStream = null;
+    let inFlight = false;
 
     async function startCamera(deviceId) {
       if (!isSecure) { log('HTTPSで開いてください'); return; }
@@ -70,14 +73,14 @@
         const constraints = {
           audio: false,
           video: deviceId ? { deviceId: { exact: deviceId } } :
-                            { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }
+                            { facingMode: 'environment', width: { ideal: 480 }, height: { ideal: 360 } }
         };
         log('カメラ起動中…（権限を許可）');
         currentStream = await navigator.mediaDevices.getUserMedia(constraints);
         video.srcObject = currentStream;
         await video.play();
-        await listCameras(); // 許可後にラベルが出る
-        log('カメラ起動OK。必要なときだけ「1枚撮って検出」を押してください。');
+        await listCameras();
+        log('カメラ起動OK。「1枚撮って検出」を押してね。');
       } catch (e) {
         log('カメラ起動失敗: ' + e.message);
       }
@@ -89,9 +92,9 @@
       log('カメラ停止');
     }
 
-    function grabFrameBlob(quality = 0.6) {
-      const w = Math.min(640, video.videoWidth || 640);
-      const h = Math.round((video.videoHeight || 480) * (w / (video.videoWidth || 640)));
+    function grabFrameBlob(quality = 0.4) { // さらに圧縮
+      const w = Math.min(480, video.videoWidth || 480);
+      const h = Math.round((video.videoHeight || 360) * (w / (video.videoWidth || 480)));
       canvas.width = w; canvas.height = h;
       const ctx = canvas.getContext('2d');
       ctx.drawImage(video, 0, 0, w, h);
@@ -99,9 +102,11 @@
     }
 
     async function detectOnce() {
+      if (inFlight) return; // 連打防止
+      inFlight = true; snapBtn.disabled = true;
       try {
         log('1枚キャプチャ → 送信中...');
-        const blob = await grabFrameBlob(0.6);
+        const blob = await grabFrameBlob(0.4);
         const fd = new FormData();
         fd.append('image', blob, 'frame.jpg');
         const res = await fetch('/detect', { method: 'POST', body: fd });
@@ -115,6 +120,8 @@
       } catch (e) {
         resultEl.textContent = '';
         log('検出エラー: ' + e.message);
+      } finally {
+        inFlight = false; snapBtn.disabled = false;
       }
     }
 
@@ -123,7 +130,6 @@
     stopBtn.addEventListener('click', () => stopCamera());
     cameraSelect.addEventListener('change', () => startCamera(cameraSelect.value));
 
-    // 初期
     if (navigator.mediaDevices?.enumerateDevices) listCameras();
     log('まず「カメラ開始」を押してください。');
   </script>
